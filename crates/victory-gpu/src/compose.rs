@@ -38,13 +38,32 @@ float4 ps(V v) : SV_Target {
     float4 o = over.SampleLevel(smooth_, v.uv, 0);
     return float4(saturate(o.rgb + s.rgb * (1 - saturate(o.a))), 1);
 }
+// Xbox HDR10 planes are PQ-encoded Rec.2020. If HDR output is lost and no
+// separate SDR plane was supplied, convert to SDR with a highlight shoulder.
+float4 hdr_to_sdr(V v) : SV_Target {
+    float3 p = pow(saturate(scene.SampleLevel(smooth_, v.uv, 0).rgb), 1.0 / 78.84375);
+    float3 nits = 10000.0 * pow(max(p - 0.8359375, 0.0) / max(18.8515625 - 18.6875 * p, 1e-6), 1.0 / 0.1593017578125);
+    float3 rgb = max(float3(dot(nits, float3(1.660491, -0.5876411, -0.0728499)),
+                            dot(nits, float3(-0.1245505, 1.1328999, -0.0083494)),
+                            dot(nits, float3(-0.0181508, -0.1005789, 1.1187297))), 0.0) / 203.0;
+    float peak = max(rgb.r, max(rgb.g, rgb.b));
+    if (peak > 0.8) rgb *= (0.8 + 0.2 * (peak - 0.8) / (peak - 0.8 + 0.2)) / peak;
+    return float4(pow(saturate(rgb), 1.0 / 2.2), 1.0);
+}
+float4 dvr_to_sdr(V v) : SV_Target {
+    return float4(over.SampleLevel(smooth_, v.uv, 0).rgb, 1.0);
+}
 "#;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Mode { Composite, HdrToSdr, DvrToSdr }
 
 pub(crate) struct Composer {
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
     views: Vec<ID3D12DescriptorHeap>,
     step: u32,
+    pub(crate) mode: Mode,
 }
 // SAFETY: D3D12 objects are free-threaded.
 unsafe impl Send for Composer {}
@@ -74,10 +93,15 @@ fn compile(entry: PCSTR, target: PCSTR) -> windows::core::Result<ID3DBlob> {
 }
 
 impl Composer {
-    pub(crate) fn new(host: &Host, format: DXGI_FORMAT) -> windows::core::Result<Self> {
+    pub(crate) fn new(host: &Host, format: DXGI_FORMAT, mode: Mode) -> windows::core::Result<Self> {
+        let entry = match mode {
+            Mode::Composite => s!("ps"),
+            Mode::HdrToSdr => s!("hdr_to_sdr"),
+            Mode::DvrToSdr => s!("dvr_to_sdr"),
+        };
         let (vs, ps) = (
             compile(s!("vs"), s!("vs_5_1"))?,
-            compile(s!("ps"), s!("ps_5_1"))?,
+            compile(entry, s!("ps_5_1"))?,
         );
         // SAFETY: the blobs' own bytes, alive through the calls.
         unsafe {
@@ -116,6 +140,7 @@ impl Composer {
                 root,
                 pso,
                 views: Vec::new(),
+                mode,
                 step: device
                     .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV),
             })
@@ -224,13 +249,80 @@ mod tests {
     use super::*;
 
     #[test]
+    fn hdr_fallback_shaders_compile() {
+        compile(s!("vs"), s!("vs_5_1")).unwrap();
+        compile(s!("hdr_to_sdr"), s!("ps_5_1")).unwrap();
+        compile(s!("dvr_to_sdr"), s!("ps_5_1")).unwrap();
+    }
+
+    #[test]
+    fn hdr_fallbacks_render_on_gpu() {
+        let host = crate::host::host().expect("D3D12 device required for HDR fallback test");
+        let format = DXGI_FORMAT_R10G10B10A2_UNORM;
+        let texture = || {
+            let mut resource = None;
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 1, Height: 1, DepthOrArraySize: 1, MipLevels: 1, Format: format,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                ..Default::default()
+            };
+            unsafe { host.device.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_RENDER_TARGET, None, &mut resource,
+            ).unwrap() };
+            resource.unwrap()
+        };
+        let base = texture();
+        let dvr = texture();
+        let hdr_output = texture();
+        let dvr_output = texture();
+        let mut hdr = Composer::new(host, format, Mode::HdrToSdr).unwrap();
+        let mut sdr = Composer::new(host, format, Mode::DvrToSdr).unwrap();
+        let list = host.new_list().unwrap();
+        let cmds = &list.list;
+        unsafe {
+            // PQ 0.5807 is about 203 nits, the SDR reference white used by the fallback.
+            cmds.ClearRenderTargetView(host.rtv(Some(&base), None), &[0.5807, 0.5807, 0.5807, 1.0], None);
+            cmds.ClearRenderTargetView(host.rtv(Some(&dvr), None), &[0.25, 0.5, 0.75, 1.0], None);
+            cmds.ResourceBarrier(&[
+                crate::host::transition(&base, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+                crate::host::transition(&dvr, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+            ]);
+            for (composer, output) in [(&mut hdr, &hdr_output), (&mut sdr, &dvr_output)] {
+                composer.record(host, 0, cmds, [(&base, format), (&dvr, format)], output, (1, 1)).unwrap();
+                cmds.ResourceBarrier(&[crate::host::transition(output, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            }
+            let (a, af) = crate::capture::read_back(&host.device, cmds, &hdr_output).unwrap();
+            let (b, bf) = crate::capture::read_back(&host.device, cmds, &dvr_output).unwrap();
+            list.close();
+            host.execute(&[&list]);
+            host.device.GetDeviceRemovedReason().unwrap();
+            let read = |buffer: &ID3D12Resource, offset: u64| {
+                let mut ptr = std::ptr::null_mut();
+                buffer.Map(0, None, Some(&mut ptr)).unwrap();
+                let word = ptr.cast::<u8>().add(offset as usize).cast::<u32>().read_unaligned();
+                buffer.Unmap(0, None);
+                [word & 1023, (word >> 10) & 1023, (word >> 20) & 1023]
+            };
+            let converted = read(&a, af.Offset);
+            let copied = read(&b, bf.Offset);
+            for channel in converted { assert!((950..=1000).contains(&channel), "HDR conversion {converted:?}"); }
+            for (channel, expected) in copied.into_iter().zip([256u32, 512, 767]) {
+                assert!(channel.abs_diff(expected) <= 2, "SDR plane {copied:?}");
+            }
+        }
+    }
+
+    #[test]
     fn composes_scaled_premultiplied_plane_on_gpu() {
         let Some(host) = crate::host::host() else {
             eprintln!("skipping display-plane readback: no D3D12 device");
             return;
         };
         let format = DXGI_FORMAT_R8G8B8A8_UNORM;
-        let mut compositor = Composer::new(host, format).unwrap();
+        let mut compositor = Composer::new(host, format, Mode::Composite).unwrap();
         let list = host.new_list().unwrap();
         let texture = |width: u64| -> ID3D12Resource {
             let mut resource = None;

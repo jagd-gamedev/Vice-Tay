@@ -13,6 +13,7 @@ use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
+use windows::Win32::Graphics::Gdi::{MonitorFromWindow, MONITOR_DEFAULTTOPRIMARY};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -9305,6 +9306,40 @@ fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
 
 const BUFFERS: u32 = 2;
 
+/// Windows HDR state and display luminance for the title's monitor. When a
+/// title has not made a window yet, Windows' primary monitor is used.
+pub fn hdr_display() -> Option<[f32; 3]> {
+    hdr_display_for(title_window().unwrap_or(HWND(std::ptr::null_mut())))
+}
+
+fn hdr_display_for(hwnd: HWND) -> Option<[f32; 3]> {
+    // SAFETY: a valid window or null to select the primary monitor.
+    let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY) };
+    let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)) }.ok()?;
+    for a in 0.. {
+        let adapter = match unsafe { factory.EnumAdapters1(a) } {
+            Ok(adapter) => adapter,
+            Err(_) => break,
+        };
+        for i in 0.. {
+            let output = match unsafe { adapter.EnumOutputs(i) } {
+                Ok(output) => output,
+                Err(_) => break,
+            };
+            let Ok(output) = output.cast::<IDXGIOutput6>() else { continue };
+            let Ok(desc) = (unsafe { output.GetDesc1() }) else { continue };
+            if desc.Monitor == monitor && desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 {
+                let values = [desc.MinLuminance, desc.MaxLuminance, desc.MaxFullFrameLuminance];
+                if values.iter().all(|v| v.is_finite()) && values[0] >= 0.0 && values[1] > 0.0 && values[2] > 0.0 {
+                    return Some(values);
+                }
+                return None;
+            }
+        }
+    }
+    None
+}
+
 struct Presenter {
     swap_chain: IDXGISwapChain3,
     width: u32,
@@ -9318,6 +9353,11 @@ struct Presenter {
     hwnd: HWND,
     meter: Meter,
     composer: Option<crate::compose::Composer>,
+    color_space: DXGI_COLOR_SPACE_TYPE,
+    output_hdr: bool,
+    output_monitor: usize,
+    next_hdr_attempt: std::time::Instant,
+    next_output_check: std::time::Instant,
     #[cfg(feature = "diagnostics")]
     panel: panel::Panel,
 }
@@ -9741,7 +9781,7 @@ impl Host {
     /// shown; else, in diagnostics builds, whether the frame was black.
     #[allow(dead_code)]
     pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
-        self.present_planes(texture, state, None, frame)
+        self.present_planes(texture, state, None, frame, None)
     }
 
     /// Shows `texture`, optionally alpha-compositing a second `overlay` plane
@@ -9752,10 +9792,13 @@ impl Host {
         state: u32,
         overlay: Option<(&ID3D12Resource, u32)>,
         frame: u64,
+        color_space: Option<u32>,
     ) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
-        let planes = overlay.and_then(|(over, over_state)| {
+        let hdr_source = color_space == Some(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020.0 as u32)
+            && swap_format(desc.Format) == Some(DXGI_FORMAT_R10G10B10A2_UNORM);
+        let overlay_planes = overlay.and_then(|(over, over_state)| {
             // SAFETY: a live overlay resource.
             let over_desc = unsafe { over.GetDesc() };
             Some((
@@ -9765,7 +9808,7 @@ impl Host {
                 crate::compose::view(&over_desc)?,
             ))
         });
-        let format = if planes.is_some() {
+        let format = if overlay_planes.is_some() && !hdr_source {
             DXGI_FORMAT_R8G8B8A8_UNORM
         } else {
             let Some(format) = swap_format(desc.Format) else {
@@ -9787,16 +9830,6 @@ impl Host {
         }
         let state_u32 = state;
         let p = presenter.as_mut()?;
-        if planes.is_some() && p.composer.is_none() {
-            match crate::compose::Composer::new(self, format) {
-                Ok(c) => p.composer = Some(c),
-                Err(e) => {
-                    tracing::warn!(error = %e, "two-plane composer not made; showing base plane only");
-                    drop(presenter);
-                    return self.present_planes(texture, state_u32, None, frame);
-                }
-            }
-        }
         if (p.width, p.height, p.format) != (width, height, format) {
             // Presents sent ahead hold back buffers until they have run.
             settle_now(WHY_SYNC);
@@ -9811,6 +9844,8 @@ impl Host {
                         p.composer = None;
                     }
                     (p.width, p.height, p.format) = (width, height, format);
+                    // Resizing can reset the swap chain's color space.
+                    p.color_space = DXGI_COLOR_SPACE_CUSTOM;
                     tracing::info!(
                         width,
                         height,
@@ -9826,17 +9861,74 @@ impl Host {
                 }
             }
         }
-        if planes.is_some() && p.composer.is_none() {
-            match crate::compose::Composer::new(self, format) {
-                Ok(c) => p.composer = Some(c),
-                Err(e) => {
-                    tracing::warn!(error = %e, "two-plane composer not made after resize; showing base plane only");
-                    drop(presenter);
-                    return self.present_planes(texture, state_u32, None, frame);
+        if hdr_source && std::time::Instant::now() >= p.next_output_check {
+            let monitor = unsafe { MonitorFromWindow(p.hwnd, MONITOR_DEFAULTTOPRIMARY) }.0 as usize;
+            let output_hdr = hdr_display_for(p.hwnd).is_some();
+            if monitor != p.output_monitor || output_hdr != p.output_hdr {
+                p.color_space = DXGI_COLOR_SPACE_CUSTOM;
+                p.next_hdr_attempt = std::time::Instant::now();
+            }
+            (p.output_monitor, p.output_hdr) = (monitor, output_hdr);
+            p.next_output_check = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        }
+        let hdr_space = DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+        let sdr_space = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+        let mut want_hdr = hdr_source && p.output_hdr;
+        if want_hdr && p.color_space != hdr_space {
+            if std::time::Instant::now() < p.next_hdr_attempt {
+                want_hdr = false;
+            } else {
+                // The output may have changed between the display query and this call.
+                let supported = unsafe { p.swap_chain.CheckColorSpaceSupport(hdr_space) }
+                    .is_ok_and(|flags| flags & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT.0 as u32 != 0);
+                want_hdr = supported && unsafe { p.swap_chain.SetColorSpace1(hdr_space) }.is_ok();
+                if want_hdr {
+                    p.color_space = hdr_space;
+                    tracing::info!("display output: HDR10 color space enabled");
+                } else {
+                    p.next_hdr_attempt = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    tracing::warn!("display output: HDR10 color space unavailable, using SDR fallback");
                 }
             }
         }
+        if !want_hdr && p.color_space != sdr_space {
+            if let Err(error) = unsafe { p.swap_chain.SetColorSpace1(sdr_space) } {
+                tracing::warn!(%error, "could not switch the swap chain to SDR");
+                return None;
+            }
+            p.color_space = sdr_space;
+            tracing::info!("display output: SDR color space enabled");
+        }
         let state = D3D12_RESOURCE_STATES(state_u32 as i32);
+        let (planes, mode) = if hdr_source && want_hdr {
+            // In Xbox HDR presentation plane 1 may be the SDR GameDVR image,
+            // not an alpha overlay. The HDR plane already contains the scene.
+            (None, None)
+        } else if hdr_source {
+            if let Some(planes) = overlay_planes {
+                (Some(planes), Some(crate::compose::Mode::DvrToSdr))
+            } else {
+                let base_fmt = crate::compose::view(&desc)?;
+                (Some((texture, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, base_fmt, base_fmt)),
+                    Some(crate::compose::Mode::HdrToSdr))
+            }
+        } else {
+            (overlay_planes, overlay_planes.map(|_| crate::compose::Mode::Composite))
+        };
+        if let Some(mode) = mode {
+            if p.composer.as_ref().is_none_or(|c| c.mode != mode) {
+                // Existing shader-visible heaps may still be read by an
+                // earlier present; keep them alive until that work finishes.
+                if p.composer.is_some() { settle_now(WHY_SYNC); }
+                match crate::compose::Composer::new(self, format, mode) {
+                    Ok(c) => p.composer = Some(c),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "display conversion could not be made");
+                        return None;
+                    }
+                }
+            }
+        }
         // SAFETY: our swap chain, list and live source texture(s).
         unsafe {
             let index = p.swap_chain.GetCurrentBackBufferIndex();
@@ -9892,11 +9984,15 @@ impl Host {
                         copy.close();
                         drop(back);
                         drop(presenter);
+                        if hdr_source {
+                            tracing::warn!(%err, "could not record HDR-to-SDR fallback");
+                            return None;
+                        }
                         tracing::warn!(%err, "could not record display composite; presenting the base plane");
-                        return self.present_planes(texture, state_u32, None, frame);
+                        return self.present_planes(texture, state_u32, None, frame, color_space);
                     }
                     static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-                    if !ONCE.swap(true, Ordering::Relaxed) {
+                    if mode == Some(crate::compose::Mode::Composite) && !ONCE.swap(true, Ordering::Relaxed) {
                         tracing::info!(
                             frame,
                             width,
@@ -10082,6 +10178,11 @@ impl Host {
                 hwnd,
                 meter: Meter::new(),
                 composer: None,
+                color_space: DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
+                output_hdr: false,
+                output_monitor: 0,
+                next_hdr_attempt: std::time::Instant::now(),
+                next_output_check: std::time::Instant::now(),
                 #[cfg(feature = "diagnostics")]
                 panel: panel::Panel::new(),
             })

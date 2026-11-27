@@ -111,7 +111,7 @@ mod watch;
 mod texback;
 
 #[cfg(windows)]
-pub use host::on_failure;
+pub use host::{hdr_display, on_failure};
 
 /// Whether `switch` is on now, if it is one of those `VICTORY_AB` turns on and
 /// off while the title runs (`ab`).

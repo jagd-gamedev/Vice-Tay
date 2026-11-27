@@ -57,13 +57,34 @@ pub const INTERFACES: &[Interface] = &[
 
 type This = *const Object;
 
-/// 2: disabled. We present in SDR, so the title must render SDR.
-// shortcut: HDR output is not done (see the presentation items in
-// `TODO.md`); report enabled, with the host display's luminance, once the
-// swap chain can present HDR.
-extern "system" fn try_enable_hdr(_: This, preference: u32, _info: *mut c_void) -> u32 {
-    tracing::info!(preference, "HDR mode: disabled (SDR presentation)");
-    2
+/// The title renders HDR10 only when the Windows output is currently HDR.
+#[repr(C)]
+struct HdrModeInfo {
+    min: f32,
+    max: f32,
+    max_full_frame: f32,
+}
+
+extern "system" fn try_enable_hdr(_: This, preference: u32, info: *mut c_void) -> u32 {
+    #[cfg(windows)]
+    let display = victory_gpu::hdr_display();
+    #[cfg(not(windows))]
+    let display: Option<[f32; 3]> = None;
+    hdr_result(preference, info, display)
+}
+
+fn hdr_result(preference: u32, info: *mut c_void, display: Option<[f32; 3]>) -> u32 {
+    if let Some([min, max, max_full_frame]) = display {
+        if !info.is_null() {
+            // SAFETY: the optional output points to the title's HdrModeInfo.
+            unsafe { info.cast::<HdrModeInfo>().write(HdrModeInfo { min, max, max_full_frame }) };
+        }
+        tracing::info!(preference, min, max, max_full_frame, "HDR mode: enabled");
+        1
+    } else {
+        tracing::info!(preference, "HDR mode: disabled (SDR presentation)");
+        2
+    }
 }
 
 /// Nothing launches URIs for the title: no store, browser or console app
@@ -176,12 +197,21 @@ mod tests {
     use crate::modules::xgameruntime::{S_OK, method};
 
     #[test]
+    fn hdr_result_reports_display_luminance_and_sdr_fallback() {
+        let mut info = HdrModeInfo { min: -1.0, max: -1.0, max_full_frame: -1.0 };
+        let out = (&raw mut info).cast();
+        assert_eq!(hdr_result(0, out, None), 2);
+        assert_eq!((info.min, info.max, info.max_full_frame), (-1.0, -1.0, -1.0));
+        assert_eq!(hdr_result(0, out, Some([0.01, 1000.0, 500.0])), 1);
+        assert_eq!((info.min, info.max, info.max_full_frame), (0.01, 1000.0, 500.0));
+        assert_eq!(hdr_result(0, std::ptr::null_mut(), Some([0.01, 1000.0, 500.0])), 1);
+    }
+
+    #[test]
     fn sdr_and_display_deferrals() {
         type Hdr = extern "system" fn(This, u32, *mut c_void) -> u32;
-        assert_eq!(
-            method::<Hdr>(&HDR_OBJECT, 0x20)(&HDR_OBJECT, 0, std::ptr::null_mut()),
-            2
-        );
+        let result = method::<Hdr>(&HDR_OBJECT, 0x20)(&HDR_OBJECT, 0, std::ptr::null_mut());
+        assert!(result == 1 || result == 2);
         type Acquire = extern "system" fn(This, *mut *mut c_void) -> HRESULT;
         type Close = extern "system" fn(This, *mut c_void);
         let mut handle = std::ptr::null_mut();

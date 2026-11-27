@@ -666,6 +666,21 @@ struct RetailPlane {
 #[cfg(windows)]
 const _: () = assert!(size_of::<RetailPlane>() == 72);
 
+/// Retail planes declare a DXGI color space after the optional rectangles.
+/// Read it defensively: older single-plane callers only supply the prefix.
+#[cfg(windows)]
+fn plane_color_space(parameters: *const Plane) -> Option<u32> {
+    let mut bytes = [0; 4];
+    let at = parameters.cast::<u8>().wrapping_add(std::mem::offset_of!(RetailPlane, color_space));
+    if !crate::host::read_into(at, &mut bytes) { return None; }
+    let value = u32::from_ne_bytes(bytes);
+    static LAST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+    if LAST.swap(value, Ordering::Relaxed) != value {
+        tracing::info!(value, "PresentX plane color space");
+    }
+    Some(value)
+}
+
 #[cfg(windows)]
 fn overlay_resource(parameters: *const Plane) -> Option<This> {
     // Read only the second prefix at the 72-byte retail PresentX stride. A
@@ -997,7 +1012,7 @@ extern "system" fn present(
             this,
             texture.map(|(_, copy, state)| (copy, state)),
             overlay.map(|(_, copy, state)| (copy, state)),
-            Shown { frame, resource },
+            Shown { frame, resource, color_space: plane_color_space(plane_parameters) },
         );
         called.end();
         #[cfg(feature = "diagnostics")]
@@ -1033,7 +1048,7 @@ extern "system" fn present(
             texture,
             state,
             overlay.as_ref().map(|(_, tex, st)| (*tex, *st)),
-            Shown { frame, resource: resource as usize },
+            Shown { frame, resource: resource as usize, color_space: plane_color_space(plane_parameters) },
         );
         crate::resource::host_transition(resource, state);
         if let Some((over_res, _, over_state)) = overlay {
@@ -1079,6 +1094,7 @@ fn frame_ends() {
 struct Shown {
     frame: u64,
     resource: usize,
+    color_space: Option<u32>,
 }
 
 /// Shows `texture` (with optional `overlay` plane blended over it) in our window.
@@ -1092,7 +1108,7 @@ fn show_planes(
     let Some(host) = crate::host::host() else {
         return;
     };
-    let shown = host.present_planes(texture, state, overlay, what.frame);
+    let shown = host.present_planes(texture, state, overlay, what.frame, what.color_space);
     #[cfg(feature = "diagnostics")]
     blinks(what.frame, what.resource as This, state, shown);
     #[cfg(not(feature = "diagnostics"))]
