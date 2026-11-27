@@ -8,6 +8,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 #![allow(clippy::too_many_arguments)]
 
+use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -110,7 +111,8 @@ pub extern "system" fn CreateWindowExW(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let (ex_style, style, (x, y, width, height)) = place(ex_style, style, parent, x, y, width, height);
+    let ((ex_style, style, (x, y, width, height)), state) =
+        place(ex_style, style, parent, x, y, width, height);
     // SAFETY: the title's own arguments, forwarded (the size fitted, or the
     // window made full screen).
     let hwnd = unsafe {
@@ -118,7 +120,7 @@ pub extern "system" fn CreateWindowExW(
             ex_style, class, name, style, x, y, width, height, parent, menu, instance, param,
         )
     };
-    hook(hwnd);
+    hook(hwnd, state);
     hwnd
 }
 
@@ -137,7 +139,8 @@ pub extern "system" fn CreateWindowExA(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let (ex_style, style, (x, y, width, height)) = place(ex_style, style, parent, x, y, width, height);
+    let ((ex_style, style, (x, y, width, height)), state) =
+        place(ex_style, style, parent, x, y, width, height);
     // SAFETY: the title's own arguments, forwarded (the size fitted, or the
     // window made full screen).
     let hwnd = unsafe {
@@ -145,7 +148,7 @@ pub extern "system" fn CreateWindowExA(
             ex_style, class, name, style, x, y, width, height, parent, menu, instance, param,
         )
     };
-    hook(hwnd);
+    hook(hwnd, state);
     hwnd
 }
 
@@ -159,56 +162,83 @@ fn place(
     y: i32,
     width: i32,
     height: i32,
-) -> (u32, u32, (i32, i32, i32, i32)) {
-    let fitted = fit(parent, x, y, width, height);
+) -> (Windowed, Option<WindowState>) {
+    let windowed = (ex_style, style, fit(parent, x, y, width, height));
     // SAFETY: plain queries of the primary monitor's size.
     let screen = unsafe { (wm::GetSystemMetrics(wm::SM_CXSCREEN), wm::GetSystemMetrics(wm::SM_CYSCREEN)) };
-    let full = full_screen(ex_style, style, !parent.is_null(), screen);
-    if full.is_some() {
-        // A window that could go full screen: how it goes back to a window
-        // ([`toggle_full_screen`]).
-        *WINDOWED.lock().unwrap_or_else(|e| e.into_inner()) = Some((ex_style, style, fitted));
-    }
-    if full_screen_on()
-        && let Some(full) = full
-    {
+    let Some(full) = full_screen(ex_style, style, !parent.is_null(), screen) else {
+        return (windowed, None);
+    };
+    let full_screen = full_screen_on();
+    if full_screen {
         tracing::info!(width = screen.0, height = screen.1, "title window made full screen");
-        FULL_SCREEN.store(true, std::sync::atomic::Ordering::Relaxed);
-        return full;
     }
-    (ex_style, style, fitted)
+    (if full_screen { full } else { windowed }, Some(WindowState { windowed, full_screen }))
 }
 
 /// The styles and place the title's top-level window had (or would have
 /// had) as a window, for going back from full screen.
-type Windowed = (u32, u32, (i32, i32, i32, i32));
-static WINDOWED: Mutex<Option<Windowed>> = Mutex::new(None);
-/// Whether the title's window is full screen now.
-static FULL_SCREEN: AtomicBool = AtomicBool::new(false);
+type WindowRect = (i32, i32, i32, i32);
+type Windowed = (u32, u32, WindowRect);
+
+#[derive(Clone, Copy)]
+struct WindowState {
+    windowed: Windowed,
+    full_screen: bool,
+}
+
+static WINDOWS: Mutex<BTreeMap<usize, WindowState>> = Mutex::new(BTreeMap::new());
 
 /// F11 or Alt+Enter on the title's window: full screen (frameless, over the
 /// monitor it is on) or back to the window it was made as, whichever it is
 /// not now. The swap chain stretches to either.
 fn toggle_full_screen(hwnd: HWND) {
-    let Some(windowed) = *WINDOWED.lock().unwrap_or_else(|e| e.into_inner()) else { return };
-    let full = FULL_SCREEN.load(std::sync::atomic::Ordering::Relaxed);
+    let Some(mut state) = WINDOWS.lock().unwrap_or_else(|e| e.into_inner()).get(&(hwnd as usize)).copied() else {
+        return;
+    };
     // SAFETY: queries of the title's window and the monitor it is on.
     let monitor = unsafe {
         let mut info: windows_sys::Win32::Graphics::Gdi::MONITORINFO = std::mem::zeroed();
         info.cbSize = std::mem::size_of_val(&info) as u32;
         let on = windows_sys::Win32::Graphics::Gdi::MonitorFromWindow(hwnd, windows_sys::Win32::Graphics::Gdi::MONITOR_DEFAULTTONEAREST);
-        (windows_sys::Win32::Graphics::Gdi::GetMonitorInfoW(on, &mut info) != 0).then_some(info.rcMonitor)
+        (windows_sys::Win32::Graphics::Gdi::GetMonitorInfoW(on, &mut info) != 0).then_some(info)
     };
     let Some(monitor) = monitor else { return };
-    let (ex_style, style, (x, y, w, h)) = toggled(full, windowed, monitor);
+    if !state.full_screen {
+        let mut rect = RECT::default();
+        // SAFETY: a query of the actual window while it still has its frame.
+        if unsafe { wm::GetWindowRect(hwnd, &mut rect) } != 0 {
+            state.windowed.2 = (rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top);
+        }
+    } else {
+        state.windowed.2 = restore_rect(state.windowed.2, monitor.rcWork);
+    }
+    let (ex_style, style, (x, y, w, h)) = toggled(state.full_screen, state.windowed, monitor.rcMonitor);
     // SAFETY: the title's own window, on its own thread (this procedure).
     unsafe {
         wm::SetWindowLongPtrW(hwnd, wm::GWL_STYLE, style as isize);
         wm::SetWindowLongPtrW(hwnd, wm::GWL_EXSTYLE, ex_style as isize);
         wm::SetWindowPos(hwnd, std::ptr::null_mut(), x, y, w, h, wm::SWP_FRAMECHANGED | wm::SWP_NOZORDER | wm::SWP_SHOWWINDOW);
     }
-    FULL_SCREEN.store(!full, std::sync::atomic::Ordering::Relaxed);
-    tracing::info!(full_screen = !full, "the title's window switched");
+    state.full_screen = !state.full_screen;
+    if let Some(saved) = WINDOWS.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&(hwnd as usize)) {
+        *saved = state;
+    }
+    tracing::info!(full_screen = state.full_screen, "the title's window switched");
+}
+
+/// A window created full screen never gave Win32 a chance to resolve its
+/// default windowed coordinates. Center a usable rectangle in the work area.
+fn restore_rect((x, y, width, height): WindowRect, area: RECT) -> WindowRect {
+    let available_width = (area.right - area.left).max(1);
+    let available_height = (area.bottom - area.top).max(1);
+    let width_default = width == wm::CW_USEDEFAULT;
+    let width = if width <= 0 { (available_width * 3 / 4).max(1) } else { width };
+    let height = if width_default || height <= 0 { (available_height * 3 / 4).max(1) } else { height };
+    let x_default = x == wm::CW_USEDEFAULT;
+    let left = if x_default { area.left + (available_width - width) / 2 } else { x };
+    let top = if x_default || y == wm::CW_USEDEFAULT { area.top + (available_height - height) / 2 } else { y };
+    (left, top, width, height)
 }
 
 /// The styles and place after a switch from full screen (`full`) or to it:
@@ -230,7 +260,9 @@ fn switches_full_screen(message: u32, wparam: WPARAM, lparam: LPARAM) -> bool {
     const VK_RETURN: usize = 0x0D;
     const VK_F11: usize = 0x7A;
     let alt = (lparam >> 29) & 1 != 0;
-    (message == wm::WM_KEYDOWN && wparam == VK_F11) || (message == wm::WM_SYSKEYDOWN && wparam == VK_RETURN && alt)
+    let repeated = (lparam >> 30) & 1 != 0;
+    !repeated && ((message == wm::WM_KEYDOWN && wparam == VK_F11)
+        || (message == wm::WM_SYSKEYDOWN && wparam == VK_RETURN && alt))
 }
 
 /// `VICTORY_FULLSCREEN=1`: the title's windows fill the whole primary monitor
@@ -333,9 +365,12 @@ fn fit_into(area: &RECT, width: i32, height: i32) -> (i32, i32) {
 }
 
 /// Puts our procedure in front of the title's.
-fn hook(hwnd: HWND) {
+fn hook(hwnd: HWND, state: Option<WindowState>) {
     if hwnd.is_null() {
         return;
+    }
+    if let Some(state) = state {
+        WINDOWS.lock().unwrap_or_else(|e| e.into_inner()).insert(hwnd as usize, state);
     }
     // SAFETY: a window this thread just created. The title's procedure is
     // stored before ours can run.
@@ -393,9 +428,12 @@ extern "system" fn window_proc(
         toggle_full_screen(hwnd);
         return 0;
     }
-    if message == wm::WM_NCDESTROY && title_window {
-        // a window the title makes again is its window then
-        TITLE_WINDOW.store(0, std::sync::atomic::Ordering::Relaxed);
+    if message == wm::WM_NCDESTROY {
+        WINDOWS.lock().unwrap_or_else(|e| e.into_inner()).remove(&(hwnd as usize));
+        if title_window {
+            // a window the title makes again is its window then
+            TITLE_WINDOW.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
     }
     // Alt or F10 puts a window into menu mode: the system runs a modal menu
     // loop on the thread that owns the window, which is the title's. The
@@ -604,6 +642,18 @@ mod tests {
         assert!(switches_full_screen(wm::WM_SYSKEYDOWN, 0x0D, alt));
         assert!(!switches_full_screen(wm::WM_KEYDOWN, 0x0D, 0));
         assert!(!switches_full_screen(wm::WM_SYSKEYDOWN, 0x0D, 0));
+        let repeat = 1 << 30;
+        assert!(!switches_full_screen(wm::WM_KEYDOWN, 0x7A, repeat));
+        assert!(!switches_full_screen(wm::WM_SYSKEYDOWN, 0x0D, alt | repeat));
+    }
+
+    #[test]
+    fn restores_default_window_geometry_on_a_monitor_with_negative_coordinates() {
+        let area = RECT { left: -1920, top: 0, right: 0, bottom: 1040 };
+        let default = wm::CW_USEDEFAULT;
+        assert_eq!(restore_rect((default, 5, default, 0), area), (-1680, 130, 1440, 780));
+        let explicit = (-1800, -20, 900, 600);
+        assert_eq!(restore_rect(explicit, area), explicit);
     }
 
     #[test]

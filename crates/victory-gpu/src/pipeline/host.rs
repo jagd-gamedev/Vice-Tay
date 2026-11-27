@@ -1045,12 +1045,19 @@ fn root_signature(
             },
         },
     };
+    serialize_root_signature(device, &desc)
+}
+
+fn serialize_root_signature(
+    device: &ID3D12Device,
+    desc: &D3D12_VERSIONED_ROOT_SIGNATURE_DESC,
+) -> windows::core::Result<(ID3D12RootSignature, Vec<u8>)> {
     // SAFETY: the description points at live arrays; the blob is read in
     // full before it is released.
     unsafe {
         let mut blob: Option<ID3DBlob> = None;
         let mut error: Option<ID3DBlob> = None;
-        if let Err(e) = D3D12SerializeVersionedRootSignature(&desc, &mut blob, Some(&mut error)) {
+        if let Err(e) = D3D12SerializeVersionedRootSignature(desc, &mut blob, Some(&mut error)) {
             if let Some(error) = error {
                 let text = std::slice::from_raw_parts(
                     error.GetBufferPointer().cast::<u8>(),
@@ -1323,14 +1330,23 @@ mod tests {
             eprintln!("no host depth bounds support; skipped");
             return;
         }
-        let Some(dxc) = dxc() else {
-            eprintln!("no PC dxc.exe; skipped");
-            return;
+        let vs = crate::host::compile(VS, windows::core::s!("main"), windows::core::s!("vs_5_1"))
+            .expect("compile depth-bounds vertex shader");
+        let ps = crate::host::compile(PS, windows::core::s!("main"), windows::core::s!("ps_5_1"))
+            .expect("compile depth-bounds pixel shader");
+        // These shaders have no bindings. Direct heap indexing requires a
+        // newer runtime than the depth-bounds feature this test exercises.
+        let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
+            Version: D3D_ROOT_SIGNATURE_VERSION_1_0,
+            Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
+                Desc_1_0: D3D12_ROOT_SIGNATURE_DESC {
+                    Flags: D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT,
+                    ..Default::default()
+                },
+            },
         };
-        let dir = tempfile::tempdir().unwrap();
-        let vs = compile(&dxc, dir.path(), VS, "vs_6_5");
-        let ps = compile(&dxc, dir.path(), PS, "ps_6_5");
-        let (root, root_blob) = root_signature(&host.device, &[], &[], false).unwrap();
+        let (root, root_blob) =
+            serialize_root_signature(&host.device, &desc).expect("create depth-bounds root signature");
 
         let mut g = GraphicsState::default();
         // Subobject 21 (`DEPTH_STENCIL1`) with `DepthBoundsTestEnable = true`,

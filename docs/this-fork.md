@@ -51,7 +51,9 @@ How each of these was found, with the numbers:
   shader-visible view heap is capped at 1,000,000 (NVIDIA), the 2^18 slots for
   tables made afresh ran out in busy scenes: hundreds of draws a frame were
   dropped, and the picture blew out to white and filled with black blobs. The
-  frame line counts the slots tables take (diagnostics builds).
+  frame line counts the slots tables take, the refusals whose free slots were
+  in pieces, and the tables that waited for flights to land for slots or were
+  refused again and dropped (diagnostics builds).
 - **Rectangle lists** expanded on the CPU find their right angles from the element
   the input layout names `POSITION`, not from the first two-component element,
   which may be a texture coordinate.

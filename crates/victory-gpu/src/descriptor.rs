@@ -428,10 +428,7 @@ pub(crate) fn sync_heaps() {
             // calls marked, in place of the changed pages; and a few of the
             // pages the watch says were written, looked at whole.
             let phase = crate::timeline::span("the heaps' records: the marks taken (renderer port 2)");
-            for (first, n) in crate::port_descriptors::take(start).unwrap_or_default() {
-                let from = start as usize + first as usize * step as usize;
-                parts.push((from, from + n as usize * step as usize, false));
-            }
+            let marked = crate::port_descriptors::take(start).unwrap_or_default();
             phase.end();
             if crate::port_descriptors::ask_due(frame) {
                 let began = std::time::Instant::now();
@@ -441,9 +438,13 @@ pub(crate) fn sync_heaps() {
                 spent[0] += since(began);
                 crate::port_descriptors::asked(&taken);
             }
-            for page in crate::port_descriptors::to_check(frame) {
-                parts.push((page.max(start as usize), (page + crate::watch::PAGE).min(end as usize), true));
-            }
+            parts = port_scan_parts(
+                &marked,
+                crate::port_descriptors::to_check(frame),
+                start as usize,
+                end as usize,
+                step as usize,
+            );
         } else {
             let began = std::time::Instant::now();
             let phase = crate::timeline::span("the heaps' records: asking");
@@ -824,6 +825,51 @@ fn changed_slots(
     let first = from / step;
     let last = to.div_ceil(step).min(u64::from(mirrored_count));
     first.min(last)..last
+}
+
+/// Marks own their slots, even if a wider fallback read would fail. The
+/// fallback takes only the complete slots between the sorted marked runs.
+/// The write watch supplies each fallback page at most once.
+#[cfg(windows)]
+fn port_scan_parts(
+    marked: &[(u32, u32)],
+    pages: Vec<usize>,
+    heap_start: usize,
+    heap_end: usize,
+    step: usize,
+) -> Vec<(usize, usize, bool)> {
+    let mut parts: Vec<_> = marked
+        .iter()
+        .map(|&(first, count)| {
+            let from = heap_start + first as usize * step;
+            (from, from + count as usize * step, false)
+        })
+        .collect();
+    let marked_parts = parts.len();
+    for page in pages {
+        let from = page.max(heap_start);
+        let to = (page + crate::watch::PAGE).min(heap_end);
+        if from >= to {
+            continue;
+        }
+        let mut from = heap_start + (from - heap_start).div_ceil(step) * step;
+        let to = heap_start + (to - heap_start) / step * step;
+        let first_mark = parts[..marked_parts].partition_point(|&(_, end, _)| end <= from);
+        for n in first_mark..marked_parts {
+            let (mark_from, mark_to, _) = parts[n];
+            if from >= to || mark_from >= to {
+                break;
+            }
+            if from < mark_from {
+                parts.push((from, mark_from, true));
+            }
+            from = mark_to;
+        }
+        if from < to {
+            parts.push((from, to, true));
+        }
+    }
+    parts
 }
 
 /// The title's view heap that shaders of a list without one get their views
@@ -2005,6 +2051,48 @@ mod tests {
                 capped
             ),
             5..5
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn marked_and_fallback_scans_own_disjoint_slots() {
+        let page = crate::watch::PAGE;
+        let step = 32;
+        let start = page;
+        let per_page = (page / step) as u32;
+        let marked = [(per_page - 1, 2), (per_page + 4, 2), (3 * per_page - 1, 2)];
+        let parts = port_scan_parts(
+            &marked,
+            vec![start + 3 * page, start + page],
+            start,
+            start + 4 * page,
+            step,
+        );
+        assert_eq!(
+            parts,
+            [
+                (start + page - step, start + page + step, false),
+                (start + page + 4 * step, start + page + 6 * step, false),
+                (start + 3 * page - step, start + 3 * page + step, false),
+                (start + 3 * page + step, start + 4 * page, true),
+                (start + page + step, start + page + 4 * step, true),
+                (start + page + 6 * step, start + 2 * page, true),
+            ]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_mark_owns_its_slot_when_the_slot_straddles_a_fallback_page() {
+        let page = crate::watch::PAGE;
+        let step = 32;
+        let start = page - step / 2;
+        let marked = [(0, 2)];
+        let parts = port_scan_parts(&marked, vec![page], start, start + 2 * page, step);
+        assert_eq!(
+            parts,
+            [(start, start + 2 * step, false), (start + 2 * step, start + page, true)]
         );
     }
 

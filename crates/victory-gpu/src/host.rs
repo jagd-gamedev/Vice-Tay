@@ -2342,18 +2342,17 @@ enum Step {
     /// the card could bring the bytes instead.
     Fill(usize, usize, usize, Option<card_steps::FillTo>),
     /// Brings a range (address, bytes) of a buffer's host copy up to date:
-    /// once per submission, whichever lists ask, until a `Copy` or `Run`
-    /// intervenes.
+    /// once per submission, whichever lists ask, until a title copy intervenes.
     Refresh(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
-    /// Work that may write title memory.
-    Run(Box<dyn Fn() + Send>),
+    /// A submission-time title copy whose placed route did not apply.
+    RawCopy { dst: usize, src: usize, len: usize },
     /// Work that writes host memory only, and the title memory it reads
     /// (from, to; empty for none).
     Host(Box<dyn Fn() + Send>, (usize, usize)),
     /// Shaders write a range (address, bytes) of a buffer's host copy.
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Brings a texture's staging buffer up to date: once per submission,
-    /// whichever lists sample it, until a `Copy` or `Run` intervenes.
+    /// whichever lists sample it, until a title copy intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
     /// Reads a CPU-written linear movie plane into a per-list upload buffer.
     Plane((usize, usize), Box<dyn Fn() + Send>),
@@ -3159,7 +3158,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         return Some(WHY_READ);
                     }
                 }
-                Step::Run(_) => return Some(WHY_RUN),
+                Step::RawCopy { .. } => return Some(WHY_RUN),
                 Step::Placed(p) => match p.waits(written) {
                     place::Waits::No => {}
                     place::Waits::ForReaders => placed = true,
@@ -3270,9 +3269,9 @@ fn joins_asked() -> (usize, usize) {
 /// Whether the part `next` can be prepared together with `ahead`, which goes
 /// before it and has not been sent: nothing done on the CPU for it reads what
 /// those give their shaders, write back or write when they are done, and it
-/// changes no title memory that they read ([`Step::Copy`], [`Step::Run`]).
+/// changes no title memory that they read ([`Step::Copy`], [`Step::RawCopy`]).
 pub(crate) fn joinable<'a>(ahead: impl Iterator<Item = &'a HostList>, next: &[&HostList]) -> bool {
-    if next.iter().any(|l| l.deferred().copies.iter().any(|s| matches!(s, Step::Copy(..) | Step::Run(_)))) {
+    if next.iter().any(|l| l.deferred().copies.iter().any(|s| matches!(s, Step::Copy(..) | Step::RawCopy { .. }))) {
         return false;
     }
     let ahead: Vec<&HostList> = ahead.collect();
@@ -7650,17 +7649,19 @@ impl HostList {
         self.deferred().textures.contains(&key)
     }
 
-    /// Runs `work` when the list is submitted, in order with its copies.
-    /// `work` may write title memory (refreshes after it copy again).
-    pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
+    /// Records a raw title-memory copy in the order of the list's steps.
+    pub(crate) fn defer_raw_copy(&self, dst: usize, src: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
         let mut deferred = self.deferred();
-        deferred.copies.push(Step::Run(Box::new(work)));
+        deferred.copies.push(Step::RawCopy { dst, src, len });
         deferred.title_written();
         drop(deferred);
         self.changed_something();
     }
 
-    /// As [`HostList::defer`], for work that writes only host memory.
+    /// Runs work that writes only host memory when the list is submitted.
     pub(crate) fn defer_host(&self, work: impl Fn() + Send + 'static) {
         self.deferred().copies.push(Step::Host(Box::new(work), (0, 0)));
     }
@@ -7775,22 +7776,28 @@ impl HostList {
                     batch.add(shadow, *address, *len);
                     continue;
                 }
-                Step::Run(work) | Step::Host(work, _) => {
+                &Step::RawCopy { dst, src, len } => {
                     batch.fill();
                     #[cfg(feature = "diagnostics")]
                     let started = std::time::Instant::now();
-                    if matches!(step, Step::Run(_)) {
-                        batch.title_written(TitleWrite::Deferred);
-                        // (It may write anywhere, a heap's records too.)
-                        crate::port_journal::prep_wrote();
+                    batch.title_written(TitleWrite::Deferred);
+                    // The destination can alias a heap's descriptor records.
+                    crate::port_journal::prep_wrote();
+                    let _step = crate::timeline::span("a step of ours");
+                    copy_raw_title(dst, src, len);
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        add(C::Runs, 1);
+                        add(C::RunUs, started.elapsed().as_micros() as u64);
                     }
+                    continue;
+                }
+                Step::Host(work, _) => {
+                    batch.fill();
+                    #[cfg(feature = "diagnostics")]
+                    let started = std::time::Instant::now();
                     let _step = crate::timeline::span("a step of ours");
                     work();
-                    // It wrote title memory, where is not known here: the
-                    // submission's one asking ends, later refreshes ask anew.
-                    if matches!(step, Step::Run(_)) {
-                        crate::watch::ask_once_end();
-                    }
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Runs, 1);
@@ -8680,8 +8687,8 @@ impl Batch {
         }
         let ahead = spans.len() > 1;
         if ahead {
-            let ranges: Vec<(usize, usize)> = spans.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)).collect();
-            crate::watch::ask_ahead(&ranges);
+            let ranges = spans.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2));
+            crate::watch::ask_ahead(ranges);
         }
         #[cfg(feature = "diagnostics")]
         FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
@@ -8727,7 +8734,7 @@ impl Batch {
                     }
                     Step::GpuWrite(shadow, ..) => Touch::Write(std::sync::Arc::as_ptr(shadow) as usize),
                     Step::Copy(..) if taken(list, i) => Touch::Nothing,
-                    Step::Copy(..) | Step::Run(_) | Step::Placed(_) => break 'steps,
+                    Step::Copy(..) | Step::RawCopy { .. } | Step::Placed(_) => break 'steps,
                     _ => Touch::Nothing,
                 });
             }
@@ -8850,13 +8857,8 @@ impl Batch {
         let ahead = self.refreshes.len() > 1;
         if ahead {
             let started = std::time::Instant::now();
-            let ranges: Vec<(usize, usize)> = self
-                .refreshes
-                .iter()
-                .filter(|r| r.0.asked_ahead())
-                .map(|r| (r.1, r.2))
-                .collect();
-            crate::watch::ask_ahead(&ranges);
+            let ranges = self.refreshes.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2));
+            crate::watch::ask_ahead(ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
         if wide_refresh() && self.refreshes.len() >= 4 {
@@ -8898,6 +8900,27 @@ impl Batch {
             crate::watch::ask_ahead_done();
         }
     }
+}
+
+/// Performs a raw copy only when both spans are mapped. An exact private
+/// write can be noted without ending the standing write-watch query.
+fn copy_raw_title(dst: usize, src: usize, len: usize) {
+    let reading = if len <= crate::watch::RAW_COPY_WATCH_LIMIT {
+        crate::watch::title_memory_reading_now()
+    } else {
+        None
+    };
+    let note = reading.as_ref().and_then(|reading| crate::watch::prepare_raw_copy_note(reading, dst, len));
+    let reading = reading.filter(|_| note.is_some());
+    if crate::texture::committed(src as *const u8, len) && crate::texture::committed(dst as *const u8, len) {
+        // SAFETY: the raw title copy accepts overlapping mapped spans.
+        unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len) };
+        if let (Some(note), Some(reading)) = (note, reading)
+            && note.written(&reading) {
+            return;
+        }
+    }
+    crate::watch::ask_once_end();
 }
 
 /// Copies title memory at submission. The ranges were checked against their
@@ -10136,7 +10159,8 @@ impl Host {
         height: u32,
         format: DXGI_FORMAT,
     ) -> windows::core::Result<Presenter> {
-        let hwnd = match title_window() {
+        let title = title_window();
+        let hwnd = match title {
             Some(hwnd) => hwnd,
             None => window(width, height)?,
         };
@@ -10163,7 +10187,9 @@ impl Host {
             // Alt+Enter is the title window's own switch to and from full
             // screen (frameless, the swap chain stretched); DXGI's would make
             // it exclusive full screen, whose buffers nothing resizes.
-            let _ = factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
+            if title.is_some() {
+                let _ = factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
+            }
             let copy = self.new_list()?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");

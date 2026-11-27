@@ -55,6 +55,17 @@ pub(crate) enum C {
     DynamicRefused,
     DynamicNs,
     DynamicSlots,
+    /// Of the refused: those with enough slots free in all, but no run of
+    /// them together (the slots in pieces, not taken).
+    DynamicPieces,
+    /// Tables that, refused, waited for the flights in the air to land
+    /// before they asked again (`crate::draw`'s `dynamic_or_settle`), the
+    /// microseconds of those waits (counted in "a blocking fence wait"
+    /// too), and the tables refused again after it: their draws or
+    /// dispatches are dropped.
+    DynamicSettles,
+    DynamicSettleUs,
+    DynamicLost,
     /// Marker texts for device-removed data (`HostList::note`).
     NoteNs,
     /// Ranges given to shaders (steps), their snapshots, and the bytes
@@ -1304,7 +1315,9 @@ pub(crate) fn log(frames: f64) {
     tracing::info!(
         "recording per frame ({frames:.0} frames): {:.0} list calls {:.1} ms (all recording \
          threads); {:.1} ms waiting for pipelines; dynamic slots: {:.0} tables asked, {:.0} \
-         refused, {:.1} ms searching, {:.0} slots taken; notes {:.1} ms; shader-written ranges: {:.0} steps in \
+         refused ({:.1} with enough slots free, but in pieces), {:.1} ms searching, {:.0} slots taken, \
+         {:.1} tables waited {:.1} ms for flights to land, {:.1} refused again (dropped); notes {:.1} ms; \
+         shader-written ranges: {:.0} steps in \
          {:.1} submissions, snapshots {:.1} ms, {:.1} MB compared back; sparse reads {:.1} ms; \
          guards {:.1} ms; {:.1} MB copied whole (memory not watched); {:.1} frame waits \
          sleeping {:.1} ms (all threads); ranges of shaders that cannot store to buffers: \
@@ -1314,8 +1327,12 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::PipelineWaitUs as usize]),
         c[C::DynamicAsked as usize],
         c[C::DynamicRefused as usize],
+        c[C::DynamicPieces as usize],
         c[C::DynamicNs as usize] / 1e6,
         c[C::DynamicSlots as usize],
+        c[C::DynamicSettles as usize],
+        ms(c[C::DynamicSettleUs as usize]),
+        c[C::DynamicLost as usize],
         c[C::NoteNs as usize] / 1e6,
         c[C::GpuWrites as usize],
         c[C::BackSubmissions as usize],

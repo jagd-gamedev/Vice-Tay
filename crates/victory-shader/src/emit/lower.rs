@@ -3017,7 +3017,11 @@ impl<'a> Lower<'a> {
                 let wave: u32 = if self.x.native.wave64 { 64 } else { 32 };
                 let threads = cs.threads.iter().product::<u32>();
                 let (e, i32t) = (self.s.entry, self.s.t.i32);
-                let flat = self.s.op(e, "flattenedThreadIdInGroup.i32", Attr::ReadNone, i32t, 96, &[]);
+                // On relabelled waves, use the same base as the console thread ID.
+                // A host wave's physical IDs need not be in one contiguous range.
+                let flat = self.wave_base().unwrap_or_else(|| {
+                    self.s.op(e, "flattenedThreadIdInGroup.i32", Attr::ReadNone, i32t, 96, &[])
+                });
                 let w = self.s.m.i32(wave.trailing_zeros());
                 let index = self.s.m.bin(e, Bin::LShr, flat, w);
                 let six = self.s.m.i32(6);
@@ -4562,6 +4566,11 @@ impl<'a> Lower<'a> {
         self.s.m.cast(c, Cast::Trunc, hi, self.s.t.i32)
     }
 
+    fn nan_guard_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_NAN_GUARD").is_none_or(|v| v != "0"))
+    }
+
     /// `VICTORY_NAN_GUARD` (on unless `0`): a float a pixel program exports to a colour
     /// target, or a store writes to a typed image or buffer, with NaN made 0 and an infinity
     /// ±65504, so one bad pixel does not stay in a history the title blends into each frame.
@@ -4570,8 +4579,7 @@ impl<'a> Lower<'a> {
     /// other NaN patterns are common integers.
     // shortcut: raw buffer stores are left as they are (no type to go by).
     fn nan_guard(&mut self, f: V, strict: bool) -> V {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| std::env::var_os("VICTORY_NAN_GUARD").is_none_or(|v| v != "0")) {
+        if !Self::nan_guard_enabled() {
             return f;
         }
         let c = self.cur;
@@ -12779,6 +12787,11 @@ impl<'a> Lower<'a> {
             let regs = if d16 { count.div_ceil(2) } else { count };
             let mut vals =
                 self.vgprs(inst, data.as_ref().ok_or("buffer store data")?, regs as u8)?;
+            let integer = if typed && (d16 || Self::nan_guard_enabled()) {
+                self.integer_view(src)?
+            } else {
+                None
+            };
             if d16 {
                 // d16 data is taken as f16, widened for the 32-bit float
                 // store; through a view of an integer format it is a 16-bit
@@ -12787,9 +12800,7 @@ impl<'a> Lower<'a> {
                 // noise). Both `ResourceHeap` (`SLOT_STRIDES`) and `Table`
                 // (`SLOT_TABLE_STRIDES`, dynamic table snapshots included)
                 // populate the view-kind bits, while the handle stays a float
-                // one (`0x409`), whose raw bits RTX and WARP pass bit-exact
-                // without extra CFG blocks or touching non-d16 shaders.
-                let integer = if typed { self.integer_view(src)? } else { None };
+                // one (`0x409`), whose raw bits RTX and WARP pass bit-exact.
                 let mut wide = Vec::new();
                 for k in 0..count {
                     let mut x = vals[(k / 2) as usize];
@@ -12816,8 +12827,8 @@ impl<'a> Lower<'a> {
             }
             let mut args = Vec::new();
             let (op, name) = if typed {
-                // shortcut: typed stores are taken to write all four channels
-                // of a float format.
+                // Shortcut: typed stores write all four channels through a
+                // float-typed handle, including when the view is integer.
                 if count != 4 || *offen || *offset != 0 {
                     return Err("a typed buffer store of some channels or at an offset");
                 }
@@ -12825,7 +12836,12 @@ impl<'a> Lower<'a> {
                 args.extend([index.unwrap_or(self.s.m.i32(0)), iu]);
                 for x in vals {
                     let f = self.as_float(x);
-                    args.push(self.nan_guard(f, false));
+                    let guarded = self.nan_guard(f, false);
+                    let value = match integer {
+                        Some((is_integer, _)) if guarded != f => self.s.m.select(c, is_integer, f, guarded),
+                        _ => guarded,
+                    };
+                    args.push(value);
                 }
                 (69, "bufferStore.f32")
             } else {
